@@ -1,507 +1,655 @@
 """
-Sync scraper for Sales-4 (آخر العروض) category on sheeel.com
-Scrapes product information and downloads images
+Last Items Scraper - Complete Production Version
+Scrapes https://www.sheeel.com/ar/sales-4.html with pagination
+Saves data to S3 with date partitioning and downloads images
 """
+
 from playwright.sync_api import sync_playwright
 import json
-import pandas as pd
-from datetime import datetime
-from pathlib import Path
+import re
 import os
 import requests
-from io import BytesIO
+from datetime import datetime
+from pathlib import Path
+import time
+import pandas as pd
 import boto3
-from botocore.exceptions import ClientError
+from urllib.parse import urlparse
+import hashlib
 
 class LastItemsScraper:
     def __init__(self, s3_bucket=None, aws_access_key=None, aws_secret_key=None):
         self.base_url = "https://www.sheeel.com/ar/sales-4.html"
         self.category = "last_items"
-        self.s3_bucket = s3_bucket or os.getenv('S3_BUCKET_NAME')
-        self.aws_access_key = aws_access_key or os.getenv('AWS_ACCESS_KEY_ID')
-        self.aws_secret_key = aws_secret_key or os.getenv('AWS_SECRET_ACCESS_KEY')
+        self.products = []
+        self.s3_bucket = s3_bucket
         
-        self.data_dir = Path('data')
-        self.images_dir = self.data_dir / 'images'
-        self.images_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.all_products = []
-        self.failed_urls = []
-        
-        # S3 client
-        if self.s3_bucket and self.aws_access_key and self.aws_secret_key:
+        # Setup S3 if credentials provided
+        if s3_bucket and aws_access_key and aws_secret_key:
             self.s3_client = boto3.client(
                 's3',
-                aws_access_key_id=self.aws_access_key,
-                aws_secret_access_key=self.aws_secret_key,
-                region_name='us-east-1'
+                aws_access_key_id=aws_access_key,
+                aws_secret_access_key=aws_secret_key
             )
         else:
             self.s3_client = None
+        
+        # Date partitioning
+        now = datetime.now()
+        self.year = now.strftime("%Y")
+        self.month = now.strftime("%m")
+        self.day = now.strftime("%d")
+        
+        # Local folders
+        self.local_data_dir = Path("data")
+        self.local_images_dir = self.local_data_dir / "images"
+        self.local_data_dir.mkdir(exist_ok=True)
+        self.local_images_dir.mkdir(exist_ok=True)
+    
+    def extract_product_from_element(self, product_element):
+        """Extract all available fields from a product element"""
+        
+        try:
+            product_data = {}
+            
+            # ===== BASIC INFO =====
+            product_data['element_id'] = product_element.get_attribute('id') or ''
+            
+            # Extract numeric ID
+            id_match = re.search(r'product-item-info_(\d+)', product_data['element_id'])
+            product_data['product_id'] = int(id_match.group(1)) if id_match else None
+            
+            # Product name
+            name_el = product_element.query_selector('.product-item-name a, .product-item-link')
+            product_data['name'] = name_el.inner_text().strip() if name_el else None
+            
+            # Product URL
+            url_el = product_element.query_selector('a.product-item-link')
+            product_data['url'] = url_el.get_attribute('href') if url_el else None
+            
+            # SKU
+            form_el = product_element.query_selector('form[data-product-sku]')
+            product_data['sku'] = form_el.get_attribute('data-product-sku') if form_el else None
+            
+            # Product type
+            product_data['type'] = form_el.get_attribute('data-product-type') if form_el else None
+            
+            # ===== PRICING =====
+            # Old/Regular price
+            old_price_el = product_element.query_selector('.old-price .price')
+            if old_price_el:
+                old_price_text = old_price_el.inner_text().strip()
+                price_match = re.search(r'([\d.]+)', old_price_text)
+                product_data['old_price'] = float(price_match.group(1)) if price_match else None
+                product_data['old_price_text'] = old_price_text
+            else:
+                product_data['old_price'] = None
+                product_data['old_price_text'] = None
+            
+            # Special/Final price
+            special_price_el = product_element.query_selector('.special-price .price, .price-final_price .price')
+            if special_price_el:
+                special_price_text = special_price_el.inner_text().strip()
+                price_match = re.search(r'([\d.]+)', special_price_text)
+                product_data['special_price'] = float(price_match.group(1)) if price_match else None
+                product_data['special_price_text'] = special_price_text
+            else:
+                any_price_el = product_element.query_selector('.price')
+                if any_price_el:
+                    price_text = any_price_el.inner_text().strip()
+                    price_match = re.search(r'([\d.]+)', price_text)
+                    product_data['special_price'] = float(price_match.group(1)) if price_match else None
+                    product_data['special_price_text'] = price_text
+                else:
+                    product_data['special_price'] = None
+                    product_data['special_price_text'] = None
+            
+            # Calculate discount
+            if product_data['old_price'] and product_data['special_price']:
+                product_data['discount_amount'] = round(product_data['old_price'] - product_data['special_price'], 3)
+                product_data['discount_percent'] = round((product_data['discount_amount'] / product_data['old_price']) * 100, 1)
+            else:
+                product_data['discount_amount'] = None
+                product_data['discount_percent'] = None
+            
+            # ===== IMAGES =====
+            # Try multiple selectors to find the image
+            img_el = product_element.query_selector('a img') or product_element.query_selector('img.product-image-photo') or product_element.query_selector('img')
+            if img_el:
+                # Get image URL - prefer data-src for lazy-loaded images
+                product_data['image_url'] = img_el.get_attribute('data-src') or img_el.get_attribute('src')
+                product_data['image_alt'] = img_el.get_attribute('alt')
+                product_data['image_width'] = img_el.get_attribute('width')
+                product_data['image_height'] = img_el.get_attribute('height')
+            else:
+                product_data['image_url'] = None
+                product_data['image_alt'] = None
+                product_data['image_width'] = None
+                product_data['image_height'] = None
+            
+            # ===== BADGES & LABELS =====
+            discount_badge_el = product_element.query_selector('.discount-percent-item')
+            product_data['discount_badge'] = discount_badge_el.inner_text().strip() if discount_badge_el else None
+            
+            availability_el = product_element.query_selector('.availability.only')
+            if availability_el:
+                availability_text = availability_el.inner_text().strip()
+                product_data['availability_badge'] = availability_text
+                qty_match = re.search(r'\d+', availability_text)
+                product_data['quantity_left'] = int(qty_match.group()) if qty_match else None
+            else:
+                product_data['availability_badge'] = None
+                product_data['quantity_left'] = None
+            
+            bought_el = product_element.query_selector('.x-bought-count')
+            product_data['times_bought'] = bought_el.inner_text().strip() if bought_el else None
+            
+            stock_status_el = product_element.query_selector('.timer-expired-label span')
+            product_data['stock_status'] = stock_status_el.inner_text().strip() if stock_status_el else None
+            
+            # ===== DEAL TIMER =====
+            timer_el = product_element.query_selector('.product-deal-time .time')
+            product_data['deal_time_left'] = timer_el.inner_text().strip() if timer_el else None
+            
+            # ===== DESCRIPTION =====
+            desc_el = product_element.query_selector('.product-short-description')
+            product_data['short_description'] = desc_el.inner_text().strip() if desc_el else None
+            
+            # ===== CART INFO =====
+            cart_form = product_element.query_selector('form[data-role="tocart-form"]')
+            if cart_form:
+                product_data['add_to_cart_url'] = cart_form.get_attribute('action')
+                form_key_input = cart_form.query_selector('input[name="form_key"]')
+                product_data['form_key'] = form_key_input.get_attribute('value') if form_key_input else None
+            else:
+                product_data['add_to_cart_url'] = None
+                product_data['form_key'] = None
+            
+            # ===== METADATA =====
+            product_data['category'] = self.category
+            product_data['scraped_at'] = datetime.now().isoformat()
+            product_data['scraped_date'] = datetime.now().strftime("%Y-%m-%d")
+            
+            return product_data
+            
+        except Exception as e:
+            print(f"  ⚠ Error extracting product: {e}")
+            return None
     
     def has_next_page(self, page):
-        """Check if next page button exists"""
+        """Check if there's a next page by looking for the Next button"""
+        
         try:
+            # Look for the "Next" button in pagination
             next_button = page.query_selector('.pages-item-next a.next')
             return next_button is not None
-        except:
+        except Exception as e:
+            print(f"  ⚠ Error checking next page: {e}")
             return False
     
     def get_current_page_number(self, page):
-        """Get current page number"""
+        """Extract current page number from pagination"""
+        
         try:
-            current = page.query_selector('.pages-items .item.current .page span:last-child')
-            if current:
-                return int(current.inner_text().strip())
-        except:
-            pass
-        return 1
+            # Find the current page indicator
+            current_page = page.query_selector('.pages-items .item.current .page span:last-child')
+            if current_page:
+                return int(current_page.inner_text().strip())
+            return 1
+        except Exception as e:
+            print(f"  ⚠ Error getting current page: {e}")
+            return 1
     
     def scrape_page(self, page, page_num):
-        """Extract product links from list page"""
-        print(f"\n📄 Page {page_num}:")
-        
+        """Scrape a single page by visiting each product link and extracting full details"""
+        print(f"\n{'='*70}")
+        print(f"📄 SCRAPING PAGE {page_num}")
+        print("="*70)
         try:
+            # Wait for products
+            print(f"  ⏳ Waiting for product links...")
+            page.wait_for_selector('[id^="product-item-info_"] > a', timeout=10000)
+            # Scroll to load all products
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(2)
             # Get all product links
-            product_links = page.query_selector_all('[id^="product-item-info_"] > a')
-            print(f"  Found {len(product_links)} products")
-            
-            urls = []
-            for link in product_links:
-                try:
-                    href = link.get_attribute('href')
-                    if href and '/ar/' in href:
-                        urls.append(href)
-                except:
-                    continue
-            
-            return urls
-        
+            product_links = page.eval_on_selector_all('[id^="product-item-info_"] > a', 'elements => elements.map(e => e.href)')
+            print(f"  ✓ Found {len(product_links)} product links on page {page_num}\n")
+            # Extract data from each product page
+            page_products = []
+            for i, product_url in enumerate(product_links, 1):
+                print(f"  [{i}/{len(product_links)}] 🔗 {product_url.split('/')[-1][:50]}...")
+                product_data = self.scrape_product_detail(page.context, product_url, i)
+                if product_data:
+                    product_data['page_number'] = page_num
+                    page_products.append(product_data)
+                    print(f"       ✓ Extracted: {product_data.get('name', 'N/A')[:40]}")
+                else:
+                    print(f"       ⚠ Failed to extract product data")
+                if i % 5 == 0:
+                    print(f"\n  📊 Progress: {i}/{len(product_links)} products ({(i/len(product_links)*100):.1f}%)\n")
+            print(f"\n✓ Successfully extracted {len(page_products)} products from page {page_num}")
+            return page_products
         except Exception as e:
-            print(f"  ❌ Error extracting links: {e}")
+            print(f"❌ Error scraping page {page_num}: {e}")
             return []
-    
-    def scrape_product_detail(self, context, url):
-        """Extract all product fields from detail page"""
+
+    def scrape_product_detail(self, context, product_url, index):
+        """Visit product detail page and extract all available fields"""
         try:
-            page = context.new_page()
-            page.goto(url, wait_until='networkidle', timeout=20000)
+            detail_page = context.new_page()
+            detail_page.goto(product_url, wait_until='networkidle', timeout=30000)
+            detail_page.wait_for_selector('#maincontent .product-info-main', timeout=10000)
             
-            # Wait for main content
-            page.wait_for_selector('#maincontent .product-info-main', timeout=10000)
-            
+            # Extract fields from product-info-main
+            info = detail_page.query_selector('#maincontent .product-info-main')
             product_data = {}
             
-            # Product ID
-            try:
-                product_input = page.query_selector('input[name="product"]')
-                product_data['product_id'] = int(product_input.get_attribute('value')) if product_input else None
-            except:
+            # Product ID from form
+            product_id_input = detail_page.query_selector('input[name="product"]')
+            if product_id_input:
+                product_data['product_id'] = int(product_id_input.get_attribute('value'))
+            else:
                 product_data['product_id'] = None
             
             # Title
-            try:
-                title_el = page.query_selector('.page-title .base')
-                product_data['name'] = title_el.inner_text().strip() if title_el else 'N/A'
-            except:
-                product_data['name'] = 'N/A'
+            title_el = info.query_selector('.page-title .base')
+            product_data['name'] = title_el.inner_text().strip() if title_el else None
             
             # SKU
-            try:
-                sku_el = page.query_selector('.product-info.sku')
-                sku_text = sku_el.inner_text().strip() if sku_el else ''
-                product_data['sku'] = sku_text.split(':', 1)[1].strip() if ':' in sku_text else sku_text
-            except:
-                product_data['sku'] = 'N/A'
+            sku_el = detail_page.query_selector('.product-info.sku')
+            product_data['sku'] = sku_el.inner_text().split(':')[0].strip() if sku_el else None
             
             # Availability
-            try:
-                avail_el = page.query_selector('.availability-info')
-                product_data['availability'] = avail_el.inner_text().strip() if avail_el else 'N/A'
-            except:
-                product_data['availability'] = 'N/A'
+            avail_el = detail_page.query_selector('.availability-info')
+            product_data['availability'] = avail_el.inner_text().strip() if avail_el else None
             
             # Times bought
-            try:
-                times_el = page.query_selector('.x-bought-count')
-                product_data['times_bought'] = times_el.inner_text().strip() if times_el else 'N/A'
-            except:
-                product_data['times_bought'] = 'N/A'
+            bought_el = detail_page.query_selector('.x-bought-count')
+            product_data['times_bought'] = bought_el.inner_text().strip() if bought_el else None
             
             # Old price
-            try:
-                old_price_el = page.query_selector('.old-price .price')
-                product_data['old_price'] = old_price_el.inner_text().strip() if old_price_el else 'N/A'
-            except:
-                product_data['old_price'] = 'N/A'
+            old_price_el = detail_page.query_selector('.old-price .price')
+            product_data['old_price'] = old_price_el.inner_text().strip() if old_price_el else None
             
             # Special price
-            try:
-                special_price_el = page.query_selector('.special-price .price')
-                product_data['special_price'] = special_price_el.inner_text().strip() if special_price_el else 'N/A'
-            except:
-                product_data['special_price'] = 'N/A'
+            special_price_el = detail_page.query_selector('.special-price .price')
+            product_data['special_price'] = special_price_el.inner_text().strip() if special_price_el else None
             
             # Description
-            try:
-                desc_el = page.query_selector('.product.attribute.overview .value')
-                product_data['description'] = desc_el.inner_text().strip() if desc_el else 'N/A'
-            except:
-                product_data['description'] = 'N/A'
+            desc_el = detail_page.query_selector('.product.attribute.overview .value')
+            product_data['description'] = desc_el.inner_text().strip() if desc_el else None
             
-            # Images
-            try:
-                image_elements = page.query_selector_all('.product-gallery-image')
-                image_urls = []
-                for img_el in image_elements:
-                    try:
-                        src = img_el.get_attribute('data-src') or img_el.get_attribute('src')
-                        if src and ('http' in src or src.startswith('/')):
-                            if src.startswith('/'):
-                                src = 'https://www.sheeel.com' + src
-                            image_urls.append(src)
-                    except:
-                        continue
-                product_data['image_urls'] = image_urls
-            except:
-                product_data['image_urls'] = []
+            # Brand name (optional - may not exist for all products)
+            brand_el = detail_page.query_selector('a.amshopby-brand-title-link')
+            product_data['brand'] = brand_el.inner_text().strip() if brand_el else None
+            
+            # All images from product gallery
+            image_elements = detail_page.query_selector_all('.product-gallery-image')
+            image_urls = []
+            for img_el in image_elements:
+                img_url = img_el.get_attribute('data-src') or img_el.get_attribute('src')
+                if img_url:
+                    image_urls.append(img_url)
+            
+            product_data['image_urls'] = image_urls  # Store as array
             
             # Deal timer
-            try:
-                timer_el = page.query_selector('#deal-timer .time')
-                product_data['deal_time_left'] = timer_el.inner_text().strip() if timer_el else 'N/A'
-            except:
-                product_data['deal_time_left'] = 'N/A'
+            timer_el = detail_page.query_selector('#deal-timer .time')
+            product_data['deal_time_left'] = timer_el.inner_text().strip() if timer_el else None
             
             # Discount badge
-            try:
-                discount_el = page.query_selector('.discount-percent-item')
-                product_data['discount_badge'] = discount_el.inner_text().strip() if discount_el else 'N/A'
-            except:
-                product_data['discount_badge'] = 'N/A'
+            discount_el = detail_page.query_selector('.discount-percent-item')
+            product_data['discount_badge'] = discount_el.inner_text().strip() if discount_el else None
             
-            # Features & Specifications (from #more-info tab)
-            try:
-                features_specs = []
-                more_info = page.query_selector('#more-info')
-                if more_info:
-                    sections = more_info.query_selector_all('.attribute-info')
-                    for section in sections:
-                        try:
-                            label_el = section.query_selector('.attribute-info.label')
-                            if label_el:
-                                section_name = label_el.inner_text().strip()
-                                # Get list items
-                                items = section.query_selector_all('ul > li')
-                                for item in items:
-                                    text = item.inner_text().strip()
-                                    if text:
-                                        features_specs.append(text)
-                        except:
-                            continue
+            # Extract features by section with labels
+            more_info_container = detail_page.query_selector('#more-info')
+            if more_info_container:
+                # Get all attribute sections
+                attribute_labels = more_info_container.query_selector_all('.attribute-info.label')
                 
-                product_data['features_specs'] = features_specs
-                # Flatten features
-                for i, feature in enumerate(features_specs):
-                    product_data[f'feature_spec_{i}'] = self.clean_for_excel(feature)
-            except:
-                product_data['features_specs'] = []
+                for label_el in attribute_labels:
+                    section_name = label_el.inner_text().strip()
+                    
+                    # Get the next sibling <ul> element
+                    ul_element = label_el.evaluate_handle('node => node.nextElementSibling')
+                    
+                    # Extract list items
+                    section_features = []
+                    try:
+                        li_elements = ul_element.as_element().query_selector_all('li')
+                        for li in li_elements:
+                            section_features.append(li.inner_text().strip())
+                    except:
+                        pass
+                    
+                    # Store features based on section name
+                    if 'المميزات' in section_name or 'المواصفات' in section_name:
+                        product_data['features_specs'] = section_features
+                        # Flatten features_specs
+                        for i, feature in enumerate(section_features):
+                            product_data[f'feature_spec_{i}'] = feature
+                    elif 'محتوى' in section_name or 'العلبة' in section_name:
+                        # Box contents - single value
+                        product_data['box_contents'] = section_features[0] if section_features else None
+                    elif 'الكفالة' in section_name or 'ضمان' in section_name:
+                        # Warranty - single value
+                        product_data['warranty'] = section_features[0] if section_features else None
+                    else:
+                        # For any other sections, store with sanitized key
+                        key = section_name.replace(' ', '_').replace(':', '')
+                        product_data[f'other_{key}'] = section_features
             
-            # Box contents
-            try:
-                more_info = page.query_selector('#more-info')
-                if more_info:
-                    sections = more_info.query_selector_all('.attribute-info')
-                    for section in sections:
-                        try:
-                            label_el = section.query_selector('.attribute-info.label')
-                            if label_el:
-                                section_name = label_el.inner_text().strip()
-                                if 'محتوى' in section_name or 'العلبة' in section_name:
-                                    value_el = section.query_selector('+ p')
-                                    if value_el:
-                                        product_data['box_contents'] = self.clean_for_excel(value_el.inner_text().strip())
-                        except:
-                            continue
-                if 'box_contents' not in product_data:
-                    product_data['box_contents'] = 'N/A'
-            except:
-                product_data['box_contents'] = 'N/A'
+            # Product URL
+            product_data['url'] = product_url
             
-            # Warranty
-            try:
-                more_info = page.query_selector('#more-info')
-                if more_info:
-                    sections = more_info.query_selector_all('.attribute-info')
-                    for section in sections:
-                        try:
-                            label_el = section.query_selector('.attribute-info.label')
-                            if label_el:
-                                section_name = label_el.inner_text().strip()
-                                if 'الكفالة' in section_name or 'ضمان' in section_name:
-                                    value_el = section.query_selector('+ p')
-                                    if value_el:
-                                        product_data['warranty'] = self.clean_for_excel(value_el.inner_text().strip())
-                        except:
-                            continue
-                if 'warranty' not in product_data:
-                    product_data['warranty'] = 'N/A'
-            except:
-                product_data['warranty'] = 'N/A'
-            
-            # URL and timestamp
-            product_data['url'] = url
+            # Scraped at
             product_data['scraped_at'] = datetime.now().isoformat()
             
-            page.close()
+            detail_page.close()
             return product_data
-        
         except Exception as e:
-            print(f"    ❌ Error: {str(e)[:100]}")
-            self.failed_urls.append(url)
+            print(f"       ❌ Error: {str(e)[:50]}")
+            try:
+                detail_page.close()
+            except:
+                pass
             return None
     
-    def download_image(self, url, product_id, index):
-        """Download single image"""
-        try:
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, timeout=10, headers=headers)
-            if response.status_code == 200:
-                # Determine extension from content-type
-                content_type = response.headers.get('content-type', '').lower()
-                if 'jpeg' in content_type or 'jpg' in content_type:
-                    ext = '.jpg'
-                elif 'png' in content_type:
-                    ext = '.png'
-                elif 'gif' in content_type:
-                    ext = '.gif'
-                elif 'webp' in content_type:
-                    ext = '.webp'
-                else:
-                    ext = '.jpg'
-                
-                filename = f"{product_id}_{index}{ext}"
-                filepath = self.images_dir / filename
-                with open(filepath, 'wb') as f:
-                    f.write(response.content)
-                return str(filepath)
-        except Exception as e:
-            print(f"      Error downloading image: {e}")
+    def scrape_all_pages(self):
+        """Scrape all pages with pagination - continues until no Next button"""
         
-        return None
+        print("\n" + "="*70)
+        print("🚀 Last Items SCRAPER - WITH PAGINATION")
+        print("="*70)
+        print(f"\nURL: {self.base_url}\n")
+        
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            )
+            page = context.new_page()
+            
+            try:
+                # Load first page
+                print("📡 Loading first page...")
+                page.goto(self.base_url, wait_until='networkidle', timeout=30000)
+                print(f"✓ Page loaded: {page.title()}\n")
+                
+                page_num = 1
+                
+                # Keep scraping while there are more pages
+                while True:
+                    # Scrape current page
+                    page_products = self.scrape_page(page, page_num)
+                    self.products.extend(page_products)
+                    
+                    # Check if there's a next page
+                    if self.has_next_page(page):
+                        page_num += 1
+                        print(f"\n⏳ Waiting 2s before next page...")
+                        time.sleep(2)
+                        
+                        # Navigate to next page
+                        next_url = f"{self.base_url}?p={page_num}"
+                        print(f"📡 Loading page {page_num}: {next_url}")
+                        page.goto(next_url, wait_until='networkidle', timeout=30000)
+                    else:
+                        print(f"\n✓ No more pages found. Reached last page: {page_num}")
+                        break
+                
+                print("\n" + "="*70)
+                print("✅ ALL PAGES SCRAPED SUCCESSFULLY")
+                print("="*70)
+                print(f"\nTotal products scraped: {len(self.products)}")
+                print(f"Across {page_num} pages")
+                
+            except Exception as e:
+                print(f"\n❌ Error during scraping: {e}")
+                import traceback
+                traceback.print_exc()
+                
+            finally:
+                context.close()
+                browser.close()
+    
+    def download_image(self, image_url, product_id, image_index=0):
+        """Download product image"""
+        
+        if not image_url:
+            return None
+        
+        try:
+            # Download image
+            response = requests.get(image_url, timeout=10, stream=True)
+            response.raise_for_status()
+            
+            # Detect proper extension from Content-Type header
+            content_type = response.headers.get('Content-Type', '').lower()
+            if 'jpeg' in content_type or 'jpg' in content_type:
+                ext = '.jpg'
+            elif 'png' in content_type:
+                ext = '.png'
+            elif 'gif' in content_type:
+                ext = '.gif'
+            elif 'webp' in content_type:
+                ext = '.webp'
+            else:
+                # Fallback to URL extension or .jpg
+                ext = os.path.splitext(urlparse(image_url).path)[1] or '.jpg'
+            
+            # Include index in filename for multiple images
+            filename = f"{product_id}_{image_index}{ext}"
+            
+            # Save locally
+            local_path = self.local_images_dir / filename
+            with open(local_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            return str(local_path)
+            
+        except Exception as e:
+            print(f"  ⚠ Error downloading image for product {product_id}: {e}")
+            return None
     
     def download_all_images(self):
         """Download all product images"""
-        print("\n📷 DOWNLOADING IMAGES")
-        total_images = sum(len(p.get('image_urls', [])) for p in self.all_products)
-        print(f"  Total images to download: {total_images}")
         
-        downloaded = 0
-        for i, product in enumerate(self.all_products, 1):
-            product_id = product.get('product_id')
+        print("\n" + "="*70)
+        print("📥 DOWNLOADING PRODUCT IMAGES")
+        print("="*70)
+        
+        total_products = len(self.products)
+        total_images_downloaded = 0
+        
+        for i, product in enumerate(self.products, 1):
             image_urls = product.get('image_urls', [])
+            if not image_urls:
+                continue
             
-            local_paths = []
-            for img_idx, img_url in enumerate(image_urls):
-                local_path = self.download_image(img_url, product_id, img_idx)
+            local_image_paths = []
+            for idx, img_url in enumerate(image_urls):
+                local_path = self.download_image(img_url, product['product_id'], idx)
                 if local_path:
-                    local_paths.append(local_path)
-                    downloaded += 1
+                    local_image_paths.append(local_path)
+                    total_images_downloaded += 1
             
-            product['local_image_paths'] = local_paths
-            
-            if i % 5 == 0:
-                print(f"  Downloaded {downloaded}/{total_images} images...")
+            # Store all local paths as array
+            product['local_image_paths'] = local_image_paths
+                    
+            if i % 10 == 0:
+                print(f"  Processed {i}/{total_products} products...")
         
-        print(f"✓ Downloaded {downloaded}/{total_images} images")
+        print(f"\n✓ Downloaded {total_images_downloaded} images from {total_products} products")
+    
+    def save_to_excel(self, include_s3_paths=False):
+        """Save data to Excel file"""
+        
+        print("\n" + "="*70)
+        print("💾 SAVING TO EXCEL")
+        print("="*70)
+        
+        if not self.products:
+            print("⚠ No products to save")
+            return None
+        
+        # Create DataFrame
+        df = pd.DataFrame(self.products)
+        
+        # Remove local_image_path column if S3 is configured
+        if include_s3_paths and 'local_image_path' in df.columns:
+            df = df.drop(columns=['local_image_path'])
+            print("✓ Removed 'local_image_path' column")
+        
+        # Generate filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"last_items_{timestamp}.xlsx"
+        local_path = self.local_data_dir / filename
+        
+        # Save to Excel
+        df.to_excel(local_path, index=False, engine='openpyxl')
+        print(f"✓ Saved to: {local_path}")
+        print(f"  Rows: {len(df)}")
+        print(f"  Columns: {len(df.columns)}")
+        
+        return str(local_path)
     
     def upload_to_s3(self, local_file, s3_key):
         """Upload file to S3"""
+        
+        if not self.s3_client:
+            print("⚠ S3 not configured, skipping upload")
+            return False
+        
         try:
             self.s3_client.upload_file(local_file, self.s3_bucket, s3_key)
+            print(f"✓ Uploaded to s3://{self.s3_bucket}/{s3_key}")
             return True
-        except ClientError as e:
-            print(f"    S3 Error: {e}")
+        except Exception as e:
+            print(f"❌ Error uploading to S3: {e}")
             return False
     
     def upload_results_to_s3(self):
-        """Upload images and Excel to S3"""
-        print("\n☁️  UPLOADING TO S3")
+        """Upload Excel and images to S3 with date partitioning"""
         
-        # Get date for partitioning
-        now = datetime.now()
-        date_partition = f"year={now.year}/month={now.month:02d}/day={now.day:02d}"
+        if not self.s3_client:
+            print("\n⚠ S3 not configured, skipping S3 upload")
+            return None
         
-        # Upload images
-        print("📷 Uploading images...")
-        uploaded_images = 0
-        
-        for product in self.all_products:
-            product_id = product.get('product_id')
-            local_paths = product.get('local_image_paths', [])
-            s3_paths = []
-            
-            for idx, local_path in enumerate(local_paths):
-                try:
-                    filename = Path(local_path).name
-                    s3_key = f"sheeel_data/{date_partition}/{self.category}/images/{filename}"
-                    if self.upload_to_s3(local_path, s3_key):
-                        s3_url = f"https://{self.s3_bucket}.s3.amazonaws.com/{s3_key}"
-                        s3_paths.append(s3_url)
-                        uploaded_images += 1
-                except Exception as e:
-                    print(f"    Error uploading image: {e}")
-            
-            product['s3_image_paths'] = s3_paths
-        
-        print(f"✓ Uploaded {uploaded_images} images to S3")
-        
-        # Create Excel file with S3 paths (remove local paths)
-        print("📊 Creating Excel file with S3 paths...")
-        df = pd.DataFrame(self.all_products)
-        
-        # Remove local image paths column
-        if 'local_image_paths' in df.columns:
-            df = df.drop(columns=['local_image_paths'])
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        excel_filename = f"last_items_{timestamp}.xlsx"
-        excel_path = self.data_dir / excel_filename
-        
-        df.to_excel(excel_path, index=False, engine='openpyxl')
-        print(f"✓ Saved to: {excel_path}")
-        print(f"  Rows: {len(df)}, Columns: {len(df.columns)}")
-        
-        # Upload Excel to S3
-        try:
-            s3_key = f"sheeel_data/{date_partition}/{self.category}/excel-files/{excel_filename}"
-            if self.upload_to_s3(str(excel_path), s3_key):
-                print(f"✓ Uploaded to s3://{self.s3_bucket}/{s3_key}")
-        except Exception as e:
-            print(f"❌ Error uploading Excel: {e}")
-    
-    @staticmethod
-    def clean_for_excel(value):
-        """Remove illegal Excel characters from Arabic text"""
-        if isinstance(value, str):
-            # Remove control characters (except tab, newline, carriage return)
-            return ''.join(char for char in value if ord(char) >= 32 or char in '\t\n\r')
-        return value
-    
-    def scrape_all_pages(self):
-        """Main scraping loop with pagination"""
         print("\n" + "="*70)
-        print("🌐 SCRAPING PRODUCT DETAILS")
+        print("☁️  UPLOADING TO S3")
         print("="*70)
         
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                context = browser.new_context()
-                page = context.new_page()
-                
-                print(f"\n📡 Loading: {self.base_url}")
-                page.goto(self.base_url, wait_until='networkidle', timeout=30000)
-                print("✓ Page loaded")
-                
-                page_num = 1
-                total_products = 0
-                
-                while True:
-                    print(f"\n{'='*70}")
-                    print(f"📄 PAGE {page_num}")
-                    print(f"{'='*70}")
-                    
-                    # Get product links from current page
-                    urls = self.scrape_page(page, page_num)
-                    
-                    if not urls:
-                        print("No products found on this page")
-                        break
-                    
-                    # Scrape each product
-                    print(f"\n  Scraping {len(urls)} products...")
-                    for i, url in enumerate(urls, 1):
-                        product_data = self.scrape_product_detail(context, url)
-                        if product_data:
-                            self.all_products.append(product_data)
-                            total_products += 1
-                            
-                            if i % 5 == 0:
-                                print(f"    ✓ Progress: {i}/{len(urls)} products ({(i/len(urls)*100):.1f}%)")
-                    
-                    # Check for next page
-                    if self.has_next_page(page):
-                        next_button = page.query_selector('.pages-item-next a.next')
-                        if next_button:
-                            print(f"\n  → Moving to next page...")
-                            next_button.click()
-                            page.wait_for_load_state('networkidle')
-                            page_num += 1
-                        else:
-                            break
-                    else:
-                        print("\n  ✓ Last page reached")
-                        break
-                
-                context.close()
-                browser.close()
+        # Upload images first and add S3 paths
+        print(f"\n📷 Uploading images...")
+        total_images_uploaded = 0
         
-        except Exception as e:
-            print(f"\n❌ Error: {e}")
-            import traceback
-            traceback.print_exc()
+        for product in self.products:
+            local_image_paths = product.get('local_image_paths', [])
+            if not local_image_paths:
+                continue
+            
+            s3_image_paths = []
+            for idx, local_path in enumerate(local_image_paths):
+                if os.path.exists(local_path):
+                    image_filename = os.path.basename(local_path)
+                    image_s3_key = f"sheeel_data/year={self.year}/month={self.month}/day={self.day}/{self.category}/images/{image_filename}"
+                    
+                    if self.upload_to_s3(local_path, image_s3_key):
+                        s3_path = f"s3://{self.s3_bucket}/{image_s3_key}"
+                        s3_image_paths.append(s3_path)
+                        total_images_uploaded += 1
+                        
+                        if total_images_uploaded % 10 == 0:
+                            print(f"  Uploaded {total_images_uploaded} images...")
+            
+            # Store S3 paths as array
+            product['s3_image_paths'] = s3_image_paths
         
-        print(f"\n✓ Successfully extracted {total_products} products")
-        return total_products
+        print(f"\n✓ Uploaded {total_images_uploaded} images to S3")
+        
+        # Create ONE Excel file with S3 paths (without local_image columns)
+        print(f"\n📊 Creating Excel file with S3 paths...")
+        df = pd.DataFrame(self.products)
+        
+        # Remove local_image_paths column
+        if 'local_image_paths' in df.columns:
+            df = df.drop(columns=['local_image_paths'])
+            print("✓ Removed 'local_image_paths' column")
+        
+        # Save locally
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        excel_filename = f"last_items_{timestamp}.xlsx"
+        excel_local_path = str(self.local_data_dir / excel_filename)
+        df.to_excel(excel_local_path, index=False, engine='openpyxl')
+        print(f"✓ Saved to: {excel_local_path}")
+        print(f"  Rows: {len(df)}, Columns: {len(df.columns)}")
+        
+        # Upload to S3
+        excel_s3_key = f"sheeel_data/year={self.year}/month={self.month}/day={self.day}/{self.category}/excel-files/{excel_filename}"
+        self.upload_to_s3(excel_local_path, excel_s3_key)
+        
+        return excel_local_path
     
     def run(self):
         """Main execution flow"""
-        print("\n" + "="*70)
-        print("🚀 LAST ITEMS SCRAPER")
-        print("="*70)
-        print(f"\n⏰ Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"📍 Category: {self.category}")
-        print(f"🌐 URL: {self.base_url}")
         
-        if not self.s3_bucket:
-            print("\n⚠️  Warning: S3 not configured. Images will not be uploaded.")
-            print("   Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME environment variables")
+        print("\n" + "="*70)
+        print("Last ItemsSCRAPER - PRODUCTION")
+        print("="*70)
+        print(f"\nDate: {self.year}-{self.month}-{self.day}")
+        print(f"Category: {self.category}")
+        print(f"S3 Bucket: {self.s3_bucket or 'Not configured'}")
+        print()
         
         # Step 1: Scrape all pages
-        total = self.scrape_all_pages()
+        self.scrape_all_pages()
         
-        if total == 0:
-            print("\n❌ No products scraped")
-            return False
+        if not self.products:
+            print("\n❌ No products scraped, exiting")
+            return
         
         # Step 2: Download images
         self.download_all_images()
         
-        # Step 3: Upload to S3 (if configured)
-        if self.s3_bucket:
-            self.upload_results_to_s3()
+        # Step 3: Save to Excel and upload to S3
+        if self.s3_client:
+            # Use S3 upload which creates Excel with S3 paths
+            excel_path = self.upload_results_to_s3()
         else:
-            # Just save Excel locally
-            print("\n📊 Saving Excel file locally...")
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            excel_filename = f"last_items_{timestamp}.xlsx"
-            excel_path = self.data_dir / excel_filename
-            
-            df = pd.DataFrame(self.all_products)
-            if 'local_image_paths' in df.columns:
-                df = df.drop(columns=['local_image_paths'])
-            
-            df.to_excel(excel_path, index=False, engine='openpyxl')
-            print(f"✓ Saved to: {excel_path}")
+            # Local only - save Excel with local paths
+            excel_path = self.save_to_excel()
+        
+        # Summary
+        print("\n" + "="*70)
+        print("📊 FINAL SUMMARY")
+        print("="*70)
+        print(f"\n✅ Total products: {len(self.products)}")
+        print(f"✅ Excel file: {excel_path}")
+        print(f"✅ Images downloaded: {sum(1 for p in self.products if p.get('local_image_path'))}")
+        
+        if self.s3_client:
+            print(f"\n☁️  S3 Paths:")
+            print(f"  Excel: s3://{self.s3_bucket}/sheeel_data/year={self.year}/month={self.month}/day={self.day}/{self.category}/excel-files/")
+            print(f"  Images: s3://{self.s3_bucket}/sheeel_data/year={self.year}/month={self.month}/day={self.day}/{self.category}/images/")
         
         print("\n" + "="*70)
-        print("✅ SCRAPING COMPLETED")
-        print("="*70)
-        print(f"⏱️  Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        
-        return True
+        print("✅ SCRAPING COMPLETE!")
+        print("="*70 + "\n")
 
-if __name__ == '__main__':
-    scraper = LastItemsScraper()
+if __name__ == "__main__":
+    # Get configuration from environment or use defaults
+    s3_bucket = os.getenv('S3_BUCKET_NAME')
+    aws_access_key = os.getenv('AWS_ACCESS_KEY_ID')
+    aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+    
+    # Run scraper
+    scraper = LastItemsScraper(
+        s3_bucket=s3_bucket,
+        aws_access_key=aws_access_key,
+        aws_secret_key=aws_secret_key
+    )
+    
     scraper.run()
