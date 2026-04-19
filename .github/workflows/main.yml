@@ -1,109 +1,97 @@
-name: Fluxora Pipeline
+name: workflow pipeline
 
 on:
   schedule:
-    # Run every 2 days at 6:00 AM UTC (staggered from other workflows)
-    - cron: '0 6 */2 * *'
+    # Run every 2 days at 3:00 AM UTC
+    - cron: '0 3 */2 * *'
   
-  workflow_dispatch:
+  workflow_dispatch:  # Allow manual trigger with category selection
     inputs:
       category:
-        description: 'Category to scrape'
+        description: 'Select category to scrape'
         required: true
-        default: 'all'
         type: choice
+        default: 'all'
         options:
           - all
-          - last_items
           - end_of_season_offers
+          - last_items
 
 jobs:
   scrape:
     runs-on: ubuntu-22.04
     
     strategy:
-      fail-fast: false
+      fail-fast: false  # Continue other jobs even if one fails
       matrix:
         category:
-          - name: last_items
-            display_name: Last Items (Sales-4)
           - name: end_of_season_offers
-            display_name: End-of-Season Offers
+            display_name: end of season offers
+          - name: last_items
+            display_name: last items
     
-    # Skip if manual trigger and category doesn't match
-    if: |
-      github.event_name == 'schedule' ||
-      github.event.inputs.category == 'all'
+    name: Scrape ${{ matrix.category.display_name }}
     
     steps:
-      - name: Check if category should run
+      - name: Check if should run
+        id: should_run
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if [ "${{ github.event.inputs.category }}" != "${{ matrix.category.name }}" ] && [ "${{ github.event.inputs.category }}" != "all" ]; then
-              echo "Skipping ${{ matrix.category.name }} (selected: ${{ github.event.inputs.category }})"
-              exit 1
-            fi
+          if [[ "${{ github.event_name }}" == "schedule" ]] || \
+             [[ "${{ inputs.category }}" == "all" ]] || \
+             [[ "${{ inputs.category }}" == "${{ matrix.category.name }}" ]]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+          else
+            echo "run=false" >> $GITHUB_OUTPUT
           fi
       
       - name: Checkout code
+        if: steps.should_run.outputs.run == 'true'
         uses: actions/checkout@v4
       
       - name: Set up Python
+        if: steps.should_run.outputs.run == 'true'
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
       
       - name: Install dependencies
+        if: steps.should_run.outputs.run == 'true'
         run: |
           cd ${{ matrix.category.name }}
-          pip install --upgrade pip setuptools wheel
-          # Install numpy first to ensure compatibility
-          pip install numpy==1.26.4
-          # Now install all other dependencies
-          pip install -r requirements.txt --no-cache-dir
-          # Reinstall pandas to ensure numpy compatibility
-          pip install --force-reinstall --no-cache-dir pandas==2.1.0
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Install Playwright browsers
+        if: steps.should_run.outputs.run == 'true'
+        run: |
           playwright install chromium
           playwright install-deps chromium
       
       - name: Run scraper
+        if: steps.should_run.outputs.run == 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
-          MAX_CONCURRENT_SUBCATEGORIES: '3'
         run: |
           cd ${{ matrix.category.name }}
-          echo "🚀 Starting ${{ matrix.category.display_name }}"
           python scraper.py
       
-      - name: Upload artifacts
-        if: always()
+      - name: Upload artifacts (backup)
         uses: actions/upload-artifact@v4
+        if: steps.should_run.outputs.run == 'true' && always()
         with:
-          name: ${{ matrix.category.name }}-output
-          path: ${{ matrix.category.name }}/data/
+          name: ${{ matrix.category.name }}-results
+          path: |
+            ${{ matrix.category.name }}/data/*.xlsx
+            ${{ matrix.category.name }}/data/images/*.jpg
+            ${{ matrix.category.name }}/data/images/*.png
+            ${{ matrix.category.name }}/data/images/*.gif
+            ${{ matrix.category.name }}/data/images/*.webp
           retention-days: 7
       
-      - name: Scraper summary
-        if: always()
+      - name: Notify on failure
+        if: steps.should_run.outputs.run == 'true' && failure()
         run: |
-          echo "=================================================="
-          echo "✅ SCRAPER COMPLETED: ${{ matrix.category.display_name }}"
-          echo "=================================================="
-          echo ""
-          echo "📊 Category: ${{ matrix.category.name }}"
-          echo "📁 Output: Fluxora/${{ matrix.category.name }}/data/"
-          echo "☁️  S3: sheeel_data/year=$(date +%Y)/month=$(date +%m)/day=$(date +%d)/${{ matrix.category.name }}/"
-          echo ""
-          echo "=================================================="
-
-  success:
-    runs-on: ubuntu-22.04
-    needs: scrape
-    if: always()
-    
-    steps:
-      - name: All scrapers completed
-        run: |
-          echo "✅ All Fluxora scrapers completed successfully"
+          echo "Scraping job for ${{ matrix.category.display_name }} failed! Check the logs."
+          # Add notification logic here (Slack, email, etc.)
