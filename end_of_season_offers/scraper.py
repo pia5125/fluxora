@@ -97,7 +97,7 @@ class EndOfSeasonOffersScraper:
                 name = name.strip()
                 
                 # Filter: Only include URLs that belong to this category
-                if url and name and ('/ar/end-of-season-offers/' or '/ar/summer-fun/' )in url:
+                if url and name in url:
                     # Extract clean subcategory slug from URL
                     slug = url.split('/')[-1].replace('.html', '')
                     
