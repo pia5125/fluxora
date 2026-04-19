@@ -56,8 +56,13 @@ jobs:
       - name: Install dependencies
         run: |
           cd ${{ matrix.category.name }}
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --upgrade pip setuptools wheel
+          # Install numpy first to ensure compatibility
+          pip install numpy==1.26.4
+          # Now install all other dependencies
+          pip install -r requirements.txt --no-cache-dir
+          # Reinstall pandas to ensure numpy compatibility
+          pip install --force-reinstall --no-cache-dir pandas==2.1.0
           playwright install chromium
           playwright install-deps chromium
       
