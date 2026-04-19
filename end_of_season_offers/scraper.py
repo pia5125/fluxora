@@ -1,5 +1,5 @@
 """
-End of Season Offers Scraper - Optimized with Concurrent Subcategory Scraping
+End of Season Offers - Optimized with Concurrent Subcategory Scraping
 Scrapes https://www.sheeel.com/ar/end-of-season-offers.html and all subcategories
 Uses asyncio + semaphore for parallel subcategory processing
 Saves data to S3 with date partitioning and downloads images  
@@ -97,7 +97,7 @@ class EndOfSeasonOffersScraper:
                 name = name.strip()
                 
                 # Filter: Only include URLs that belong to this category
-                if url and name and '/ar/end-of-season-offers/' in url:
+                if url and name and ('/ar/end-of-season-offers/' or 'ar/summer-fun/' )in url:
                     # Extract clean subcategory slug from URL
                     slug = url.split('/')[-1].replace('.html', '')
                     
@@ -353,7 +353,7 @@ class EndOfSeasonOffersScraper:
         """Scrape all subcategories concurrently with semaphore control"""
         
         print("\n" + "="*70)
-        print("🚀 END OF SEASON OFFERS SCRAPER - CONCURRENT SUBCATEGORIES")
+        print(" End of Season Offers Scraper- CONCURRENT SUBCATEGORIES")
         print("="*70)
         print(f"\nMain URL: {self.base_url}")
         print(f"Max Concurrent Subcategories: {self.max_concurrent}\n")
@@ -638,7 +638,7 @@ class EndOfSeasonOffersScraper:
         """Main execution flow"""
         
         print("\n" + "="*70)
-        print(" End of Season Offers SCRAPER - OPTIMIZED (CONCURRENT)")
+        print("End of Season Offers SCRAPER - OPTIMIZED (CONCURRENT)")
         print("="*70)
         print(f"\nDate: {self.year}-{self.month}-{self.day}")
         print(f"Category: {self.category}")
