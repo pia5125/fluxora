@@ -1,0 +1,96 @@
+name: Fluxora Pipeline
+
+on:
+  schedule:
+    # Run every 2 days at 6:00 AM UTC (staggered from other workflows)
+    - cron: '0 6 */2 * *'
+  
+  workflow_dispatch:
+    inputs:
+      category:
+        description: 'Category to scrape'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - last_items
+          - end_of_season_offers
+
+jobs:
+  scrape:
+    runs-on: ubuntu-22.04
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        category:
+          - name: last_items
+            display_name: Last Items (Sales-4)
+          - name: end_of_season_offers
+            display_name: End-of-Season Offers
+    
+    # Skip if manual trigger and category doesn't match
+    if: |
+      github.event_name == 'schedule' ||
+      github.event.inputs.category == 'all' ||
+      github.event.inputs.category == matrix.category.name
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          cd ${{ matrix.category.name }}
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+      
+      - name: Run scraper
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          MAX_CONCURRENT_SUBCATEGORIES: '3'
+        run: |
+          cd ${{ matrix.category.name }}
+          echo "🚀 Starting ${{ matrix.category.display_name }}"
+          python scraper.py
+      
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.category.name }}-output
+          path: ${{ matrix.category.name }}/data/
+          retention-days: 7
+      
+      - name: Scraper summary
+        if: always()
+        run: |
+          echo "=================================================="
+          echo "✅ SCRAPER COMPLETED: ${{ matrix.category.display_name }}"
+          echo "=================================================="
+          echo ""
+          echo "📊 Category: ${{ matrix.category.name }}"
+          echo "📁 Output: Fluxora/${{ matrix.category.name }}/data/"
+          echo "☁️  S3: sheeel_data/year=$(date +%Y)/month=$(date +%m)/day=$(date +%d)/${{ matrix.category.name }}/"
+          echo ""
+          echo "=================================================="
+
+  success:
+    runs-on: ubuntu-22.04
+    needs: scrape
+    if: always()
+    
+    steps:
+      - name: All scrapers completed
+        run: |
+          echo "✅ All Fluxora scrapers completed successfully"
