@@ -33,10 +33,18 @@ jobs:
     # Skip if manual trigger and category doesn't match
     if: |
       github.event_name == 'schedule' ||
-      github.event.inputs.category == 'all' ||
-      github.event.inputs.category == matrix.category.name
+      github.event.inputs.category == 'all'
     
     steps:
+      - name: Check if category should run
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ github.event.inputs.category }}" != "${{ matrix.category.name }}" ] && [ "${{ github.event.inputs.category }}" != "all" ]; then
+              echo "Skipping ${{ matrix.category.name }} (selected: ${{ github.event.inputs.category }})"
+              exit 1
+            fi
+          fi
+      
       - name: Checkout code
         uses: actions/checkout@v4
       
