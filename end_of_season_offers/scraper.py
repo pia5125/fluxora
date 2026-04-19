@@ -83,10 +83,19 @@ class EndOfSeasonOffersScraper:
         
         try:
             # Wait for subcategory links to load
-            await page.wait_for_selector('.subcategory-link', timeout=10000)
-            
-            # Get all subcategory links
-            subcategory_elements = await page.query_selector_all('.subcategory-link')
+            # Wait for the correct container (IMPORTANT)
+            container = await page.wait_for_selector(
+            '.categories-container-sticky.second-level.child-categories',
+                  timeout=10000
+                )
+
+            # Scroll to reveal all carousel items (VERY IMPORTANT for owl-carousel)
+            for _ in range(5):
+             await page.mouse.wheel(2000, 0)
+             await asyncio.sleep(0.5)
+
+            # Now get subcategory links ONLY inside this container
+            subcategory_elements = await container.query_selector_all('a.subcategory-link')
             
             subcategories = []
             seen_slugs = set()  # Track unique subcategories
