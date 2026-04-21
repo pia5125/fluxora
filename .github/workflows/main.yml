@@ -16,6 +16,7 @@ on:
           - all
           - end_of_season_offers
           - last_items
+          - home_decor_furniture
 
 jobs:
   scrape:
@@ -29,6 +30,8 @@ jobs:
             display_name: end of season offers
           - name: last_items
             display_name: last items
+          - name: home_decor_furniture
+            display_name: Home Decor & Furniture
     
     name: Scrape ${{ matrix.category.display_name }}
     
