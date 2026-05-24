@@ -45,3 +45,4 @@ Thumbs.db
 # Local testing
 .env
 .env.local
+CF/TECHNICAL_SUMMARY.md
